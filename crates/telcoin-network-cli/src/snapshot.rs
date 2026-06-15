@@ -543,12 +543,147 @@ fn read_manifest_from_artifact(artifact: &Path) -> eyre::Result<SnapshotManifest
     ))
 }
 
-#[cfg(test)]
+/// Result values for a snapshot artifact restore run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotRestoreResult {
+    /// Target datadir that was restored.
+    pub datadir: PathBuf,
+    /// Path to the restore receipt metadata file.
+    pub receipt_path: PathBuf,
+    /// Manifest metadata from the restored snapshot.
+    pub manifest: SnapshotManifest,
+}
+
+/// Restore node data from a snapshot artifact into a datadir with force-replace semantics.
+pub fn restore_snapshot_artifact(
+    artifact_path: &Path,
+    target_datadir: &Path,
+) -> eyre::Result<SnapshotRestoreResult> {
+    if !artifact_path.exists() {
+        return Err(eyre::eyre!(
+            "snapshot artifact not found: {}",
+            artifact_path.display()
+        ));
+    }
+
+    let manifest = read_manifest(artifact_path)?;
+
+    validate_required_components(&manifest)?;
+
+    let staging_dir = target_datadir.parent()
+        .map(|p| p.join("snapshot_restore_staging"))
+        .unwrap_or_else(|| PathBuf::from("./snapshot_restore_staging"));
+
+    if staging_dir.exists() {
+        fs::remove_dir_all(&staging_dir)?;
+    }
+    fs::create_dir_all(&staging_dir)?;
+
+    extract_artifact_to_staging(artifact_path, &staging_dir)?;
+
+    validate_staging_contents(&staging_dir)?;
+
+    fs::create_dir_all(target_datadir)?;
+
+    perform_force_replace(&staging_dir, target_datadir)?;
+
+    fs::remove_dir_all(&staging_dir)?;
+
+    let receipt_path = target_datadir.join("snapshot_restore.receipt.json");
+    let receipt = serde_json::json!({
+        "restored_at_unix_secs": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default(),
+        "snapshot_block": manifest.block,
+        "snapshot_timestamp_secs": manifest.timestamp,
+        "snapshot_chain_id": manifest.chain_id,
+        "components_restored": manifest.components.keys().collect::<Vec<_>>(),
+    });
+    fs::write(&receipt_path, serde_json::to_string_pretty(&receipt)?)?;
+
+    Ok(SnapshotRestoreResult {
+        datadir: target_datadir.to_path_buf(),
+        receipt_path,
+        manifest,
+    })
+}
+
+fn validate_required_components(manifest: &SnapshotManifest) -> eyre::Result<()> {
+    let required = ["consensus", "execution_db", "execution_static_files"];
+    for component_name in &required {
+        if !manifest.components.contains_key(*component_name) {
+            return Err(eyre::eyre!(
+                "required snapshot component '{}' is missing from manifest",
+                component_name
+            ));
+        }
+
+        if let Some(ComponentManifest::Single(single)) = manifest.components.get(*component_name) {
+            if !single.required {
+                return Err(eyre::eyre!(
+                    "required component '{}' is marked as optional in manifest",
+                    component_name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn extract_artifact_to_staging(artifact: &Path, staging: &Path) -> eyre::Result<()> {
+    let file = File::open(artifact)?;
+    let mut archive = Archive::new(file);
+    archive.unpack(staging)?;
+    Ok(())
+}
+
+fn validate_staging_contents(staging: &Path) -> eyre::Result<()> {
+    let required_paths = ["consensus-db", "db", "static_files"];
+    for path in &required_paths {
+        let full_path = staging.join(path);
+        if !full_path.exists() {
+            return Err(eyre::eyre!(
+                "extracted snapshot missing required path: {}",
+                path
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn perform_force_replace(staging: &Path, target_datadir: &Path) -> eyre::Result<()> {
+    let components_to_replace = [
+        ("consensus-db", "consensus-db"),
+        ("db", "db"),
+        ("static_files", "static_files"),
+    ];
+
+    for (staging_name, target_name) in &components_to_replace {
+        let staging_path = staging.join(staging_name);
+        let target_path = target_datadir.join(target_name);
+
+        if target_path.exists() {
+            if target_path.is_dir() {
+                fs::remove_dir_all(&target_path)?;
+            } else {
+                fs::remove_file(&target_path)?;
+            }
+        }
+
+        if staging_path.exists() {
+            fs::rename(&staging_path, &target_path)?;
+        }
+    }
+
+    Ok(())
+}
+
 mod tests {
     use super::{
         create_snapshot_artifact, normalize_checksum_or_err, parse_checksum_file_contents,
-        read_manifest, resolve_manifest_read_path, write_manifest_to_dir, ComponentManifest,
-        SnapshotManifest, SNAPSHOT_MANIFEST_FILE_NAME,
+        read_manifest, resolve_manifest_read_path, restore_snapshot_artifact,
+        write_manifest_to_dir, ComponentManifest, SnapshotManifest, SNAPSHOT_MANIFEST_FILE_NAME,
     };
     use std::fs;
 
@@ -635,5 +770,70 @@ mod tests {
     fn rejects_invalid_checksum_values() {
         assert!(normalize_checksum_or_err("bad").is_err());
         assert!(parse_checksum_file_contents("\n\n").is_err());
+    }
+
+    #[test]
+    fn restores_snapshot_artifact_with_force_replace() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("consensus-db")).unwrap();
+        fs::create_dir_all(temp.path().join("db")).unwrap();
+        fs::create_dir_all(temp.path().join("static_files")).unwrap();
+
+        let artifact = temp.path().join("snapshot.tnsnap");
+        create_snapshot_artifact(temp.path(), &artifact).unwrap();
+
+        let restore_target = temp.path().join("restore_target");
+        fs::create_dir_all(&restore_target).unwrap();
+
+        let result = restore_snapshot_artifact(&artifact, &restore_target).unwrap();
+
+        assert_eq!(result.datadir, restore_target);
+        assert!(result.receipt_path.exists());
+        assert!(restore_target.join("consensus-db").exists());
+        assert!(restore_target.join("db").exists());
+        assert!(restore_target.join("static_files").exists());
+
+        let receipt = fs::read_to_string(&result.receipt_path).unwrap();
+        assert!(receipt.contains("restored_at_unix_secs"));
+        assert!(receipt.contains("snapshot_block"));
+        assert!(receipt.contains("components_restored"));
+    }
+
+    #[test]
+    fn restore_validates_required_components() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("consensus-db")).unwrap();
+        fs::create_dir_all(temp.path().join("db")).unwrap();
+        fs::create_dir_all(temp.path().join("static_files")).unwrap();
+
+        let artifact = temp.path().join("snapshot.tnsnap");
+        create_snapshot_artifact(temp.path(), &artifact).unwrap();
+
+        let restore_target = temp.path().join("restore_target");
+        fs::create_dir_all(&restore_target).unwrap();
+
+        let result = restore_snapshot_artifact(&artifact, &restore_target).unwrap();
+        assert!(result.manifest.components.contains_key("consensus"));
+        assert!(result.manifest.components.contains_key("execution_db"));
+        assert!(result.manifest.components.contains_key("execution_static_files"));
+    }
+
+    #[test]
+    fn restore_cleans_up_staging_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("consensus-db")).unwrap();
+        fs::create_dir_all(temp.path().join("db")).unwrap();
+        fs::create_dir_all(temp.path().join("static_files")).unwrap();
+
+        let artifact = temp.path().join("snapshot.tnsnap");
+        create_snapshot_artifact(temp.path(), &artifact).unwrap();
+
+        let restore_target = temp.path().join("restore_target");
+        fs::create_dir_all(&restore_target).unwrap();
+
+        restore_snapshot_artifact(&artifact, &restore_target).unwrap();
+
+        let staging = restore_target.parent().unwrap().join("snapshot_restore_staging");
+        assert!(!staging.exists());
     }
 }

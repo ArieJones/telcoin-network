@@ -14,7 +14,8 @@ use tn_reth::{
     RethDatabaseT as _, RethMdbxError, StaticFileProvider, Tables,
 };
 use crate::snapshot::{
-    create_snapshot_artifact, download_snapshot_artifact, read_manifest, ComponentManifest,
+    create_snapshot_artifact, download_snapshot_artifact, read_manifest, restore_snapshot_artifact,
+    ComponentManifest,
 };
 
 /// Inspect the execution database and print read-only statistics.
@@ -207,9 +208,18 @@ impl DbCommand {
                         );
                     }
                     SnapshotSubcommand::Restore(args) => {
+                        let restored = restore_snapshot_artifact(&args.input, &datadir)?;
                         println!(
-                            "snapshot restore foundation complete: input={} (restore pipeline to follow)",
-                            args.input.display()
+                            "snapshot artifact restored: {}",
+                            restored.datadir.display()
+                        );
+                        println!(
+                            "snapshot restore receipt: {}",
+                            restored.receipt_path.display()
+                        );
+                        println!(
+                            "snapshot block restored: {}",
+                            restored.manifest.block
                         );
                     }
                 }
