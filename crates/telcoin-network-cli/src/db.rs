@@ -13,7 +13,7 @@ use tn_reth::{
     iter_static_files, open_db_read_only, traits::TNPrimitives, DatabaseArguments, DatabaseEnv,
     RethDatabaseT as _, RethMdbxError, StaticFileProvider, Tables,
 };
-use crate::snapshot::{create_snapshot_artifact, read_manifest};
+use crate::snapshot::{create_snapshot_artifact, read_manifest, ComponentManifest};
 
 /// Inspect the execution database and print read-only statistics.
 #[derive(Debug, Parser)]
@@ -143,14 +143,37 @@ impl DbCommand {
                             .unwrap_or_else(|| datadir.join("snapshot.tnsnap"));
                         let manifest = read_manifest(&input)?;
                         println!(
-                            "snapshot manifest version={} created_at={} datadir={} consensus_head={} execution_head={} checksum={}",
-                            manifest.version,
-                            manifest.created_at_unix_secs,
-                            manifest.datadir,
-                            manifest.consensus_head.number,
-                            manifest.execution_head.number,
-                            manifest.checksum_sha256,
+                            "snapshot manifest block={} chain_id={} storage_version={} timestamp={} components={}",
+                            manifest.block,
+                            manifest.chain_id,
+                            manifest.storage_version,
+                            manifest.timestamp,
+                            manifest.components.len(),
                         );
+
+                        for (name, component) in &manifest.components {
+                            match component {
+                                ComponentManifest::Single(single) => {
+                                    println!(
+                                        "  component={} kind=single required={} included_paths={:?} excluded_paths={:?} output_files={}",
+                                        name,
+                                        single.required,
+                                        single.included_paths,
+                                        single.excluded_paths,
+                                        single.output_files.len(),
+                                    );
+                                }
+                                ComponentManifest::Chunked(chunked) => {
+                                    println!(
+                                        "  component={} kind=chunked blocks_per_file={} total_blocks={} chunks={}",
+                                        name,
+                                        chunked.blocks_per_file,
+                                        chunked.total_blocks,
+                                        chunked.chunk_sizes.len(),
+                                    );
+                                }
+                            }
+                        }
                     }
                     SnapshotSubcommand::Download(args) => {
                         let output = args
