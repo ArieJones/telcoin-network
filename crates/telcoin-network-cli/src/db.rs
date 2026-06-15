@@ -13,7 +13,9 @@ use tn_reth::{
     iter_static_files, open_db_read_only, traits::TNPrimitives, DatabaseArguments, DatabaseEnv,
     RethDatabaseT as _, RethMdbxError, StaticFileProvider, Tables,
 };
-use crate::snapshot::{create_snapshot_artifact, read_manifest, ComponentManifest};
+use crate::snapshot::{
+    create_snapshot_artifact, download_snapshot_artifact, read_manifest, ComponentManifest,
+};
 
 /// Inspect the execution database and print read-only statistics.
 #[derive(Debug, Parser)]
@@ -76,6 +78,12 @@ struct SnapshotDownloadArgs {
     /// HTTP/HTTPS URL for the snapshot artifact.
     #[arg(long, value_name = "URL")]
     url: String,
+
+    /// Expected SHA256 digest for the artifact.
+    ///
+    /// If omitted, the downloader will fetch `<url>.sha256` and parse its first checksum token.
+    #[arg(long, value_name = "SHA256")]
+    sha256: Option<String>,
 
     /// Destination path for the downloaded artifact.
     #[arg(long, value_name = "PATH")]
@@ -180,10 +188,22 @@ impl DbCommand {
                             .output
                             .clone()
                             .unwrap_or_else(|| datadir.join("snapshot.tnsnap"));
+                        let downloaded = download_snapshot_artifact(
+                            &args.url,
+                            &output,
+                            args.sha256.as_deref(),
+                        )?;
                         println!(
-                            "snapshot download foundation complete: url={} output={} (download pipeline to follow)",
-                            args.url,
-                            output.display()
+                            "snapshot artifact downloaded: {}",
+                            downloaded.artifact_path.display()
+                        );
+                        println!(
+                            "snapshot checksum sidecar: {}",
+                            downloaded.checksum_path.display()
+                        );
+                        println!(
+                            "snapshot sha256 verified: {}",
+                            downloaded.checksum_sha256
                         );
                     }
                     SnapshotSubcommand::Restore(args) => {

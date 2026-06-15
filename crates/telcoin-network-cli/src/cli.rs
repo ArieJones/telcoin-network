@@ -258,6 +258,8 @@ mod tests {
             "download",
             "--url",
             "https://example.com/snapshot.tnsnap",
+            "--sha256",
+            "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         ])
         .expect("snapshot download parsed");
 

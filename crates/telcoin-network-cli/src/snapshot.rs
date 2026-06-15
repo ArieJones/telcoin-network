@@ -5,7 +5,7 @@ use std::{
     collections::BTreeMap,
     fs::File,
     fs,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -28,6 +28,19 @@ pub struct SnapshotCreateResult {
     pub checksum_path: PathBuf,
     /// Computed artifact SHA256 digest as lower-case hex.
     pub checksum_sha256: String,
+}
+
+/// Result values for a snapshot artifact download run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotDownloadResult {
+    /// Final path to the downloaded artifact.
+    pub artifact_path: PathBuf,
+    /// Path to the written checksum sidecar file.
+    pub checksum_path: PathBuf,
+    /// Verified artifact SHA256 digest as lower-case hex.
+    pub checksum_sha256: String,
+    /// Source URL used for this download.
+    pub source_url: String,
 }
 
 /// Top-level snapshot manifest written alongside snapshot data.
@@ -343,6 +356,95 @@ pub fn create_snapshot_artifact(
     })
 }
 
+/// Download a snapshot artifact into a staged file and atomically finalize after SHA256 verification.
+pub fn download_snapshot_artifact(
+    source_url: &str,
+    output_artifact: &Path,
+    expected_sha256: Option<&str>,
+) -> eyre::Result<SnapshotDownloadResult> {
+    if !source_url.starts_with("http://") && !source_url.starts_with("https://") {
+        return Err(eyre::eyre!(
+            "snapshot download URL must start with http:// or https://"
+        ));
+    }
+
+    if let Some(parent) = output_artifact.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let staging_path = output_artifact.with_extension("part");
+    if staging_path.exists() {
+        let _ = fs::remove_file(&staging_path);
+    }
+
+    let client = reqwest::blocking::Client::builder().build()?;
+    let mut response = client.get(source_url).send()?.error_for_status()?;
+    let mut out = File::create(&staging_path)?;
+    std::io::copy(&mut response, &mut out)?;
+    out.flush()?;
+    out.sync_all()?;
+
+    let expected = match expected_sha256 {
+        Some(value) => normalize_checksum_or_err(value)?,
+        None => fetch_expected_checksum(&client, source_url)?,
+    };
+
+    let actual = sha256_file_hex(&staging_path)?;
+    if actual != expected {
+        let _ = fs::remove_file(&staging_path);
+        return Err(eyre::eyre!(
+            "snapshot checksum mismatch: expected {expected}, actual {actual}"
+        ));
+    }
+
+    fs::rename(&staging_path, output_artifact)?;
+
+    let checksum_path = output_artifact.with_extension("sha256");
+    let artifact_name = output_artifact
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("snapshot.tnsnap");
+    fs::write(&checksum_path, format!("{actual}  {artifact_name}\n"))?;
+
+    Ok(SnapshotDownloadResult {
+        artifact_path: output_artifact.to_path_buf(),
+        checksum_path,
+        checksum_sha256: actual,
+        source_url: source_url.to_string(),
+    })
+}
+
+fn fetch_expected_checksum(client: &reqwest::blocking::Client, source_url: &str) -> eyre::Result<String> {
+    let checksum_url = format!("{source_url}.sha256");
+    let body = client
+        .get(&checksum_url)
+        .send()?
+        .error_for_status()?
+        .text()?;
+    parse_checksum_file_contents(&body)
+}
+
+fn parse_checksum_file_contents(contents: &str) -> eyre::Result<String> {
+    let first_line = contents.lines().find(|line| !line.trim().is_empty()).ok_or_else(|| {
+        eyre::eyre!("checksum file is empty")
+    })?;
+    let token = first_line.split_whitespace().next().ok_or_else(|| {
+        eyre::eyre!("checksum file does not contain a checksum token")
+    })?;
+    normalize_checksum_or_err(token)
+}
+
+fn normalize_checksum_or_err(raw: &str) -> eyre::Result<String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    let is_hex = normalized.len() == 64 && normalized.bytes().all(|b| b.is_ascii_hexdigit());
+    if !is_hex {
+        return Err(eyre::eyre!(
+            "checksum must be a 64-character hex sha256 digest"
+        ));
+    }
+    Ok(normalized)
+}
+
 fn append_manifest_entry<W: std::io::Write>(
     tar_builder: &mut Builder<W>,
     manifest: &SnapshotManifest,
@@ -444,9 +546,9 @@ fn read_manifest_from_artifact(artifact: &Path) -> eyre::Result<SnapshotManifest
 #[cfg(test)]
 mod tests {
     use super::{
-        create_snapshot_artifact, read_manifest, resolve_manifest_read_path, write_manifest_to_dir,
-        ComponentManifest, SnapshotManifest,
-        SNAPSHOT_MANIFEST_FILE_NAME,
+        create_snapshot_artifact, normalize_checksum_or_err, parse_checksum_file_contents,
+        read_manifest, resolve_manifest_read_path, write_manifest_to_dir, ComponentManifest,
+        SnapshotManifest, SNAPSHOT_MANIFEST_FILE_NAME,
     };
     use std::fs;
 
@@ -506,5 +608,32 @@ mod tests {
             }
             ComponentManifest::Chunked(_) => panic!("unexpected chunked component"),
         }
+    }
+
+    #[test]
+    fn parses_checksum_file_token_formats() {
+        let parsed = parse_checksum_file_contents(
+            "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd  snapshot.tnsnap\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        );
+
+        let parsed_single = parse_checksum_file_contents(
+            "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed_single,
+            "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_checksum_values() {
+        assert!(normalize_checksum_or_err("bad").is_err());
+        assert!(parse_checksum_file_contents("\n\n").is_err());
     }
 }
