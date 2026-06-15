@@ -249,7 +249,20 @@ fn ensure_snapshot_commands_offline() -> eyre::Result<()> {
 
 fn is_telcoin_node_process(line: &str) -> bool {
     let trimmed = line.trim();
-    trimmed.contains("telcoin-network") && trimmed.contains(" node")
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    
+    for i in 0..words.len() {
+        let word = words[i];
+        // Check if this word is the telcoin-network binary
+        let is_telcoin_binary = word == "telcoin-network" || word.ends_with("/telcoin-network");
+        
+        if is_telcoin_binary && i + 1 < words.len() {
+            if words[i + 1] == "node" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -520,5 +533,32 @@ mod tests {
             "/usr/local/bin/telcoin-network db snapshot inspect"
         ));
         assert!(!is_telcoin_node_process("/usr/bin/other-process --flag"));
+    }
+
+    #[test]
+    fn rejects_node_with_various_flag_formats() {
+        let cases = vec![
+            ("/path/to/telcoin-network node", true),
+            ("/path/to/telcoin-network  node", true),
+            ("telcoin-network node --chain mainnet --rpc-port 8545", true),
+            ("/usr/bin/telcoin-network node", true),
+            ("./telcoin-network node", true),
+            ("/path/to/telcoin-network nodeprocess", false),
+            ("/path/to/telcoin-networked node", false),
+            ("/path/to/telcoin-network db", false),
+            ("/path/to/telcoin-network db snapshot create", false),
+            ("node /path/to/telcoin-network", false),
+            ("telcoin-network", false),
+            ("/path/to/other-telcoin-network node", false),
+        ];
+
+        for (line, expected) in cases {
+            assert_eq!(
+                is_telcoin_node_process(line),
+                expected,
+                "mismatch for line: {}",
+                line
+            );
+        }
     }
 }

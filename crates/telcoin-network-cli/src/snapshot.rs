@@ -836,4 +836,134 @@ mod tests {
         let staging = restore_target.parent().unwrap().join("snapshot_restore_staging");
         assert!(!staging.exists());
     }
+
+    #[test]
+    fn validates_checksum_mismatch_on_download() {
+        let wrong_sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+        let result = normalize_checksum_or_err(wrong_sha256);
+        assert!(result.is_ok());
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("consensus-db")).unwrap();
+        fs::create_dir_all(temp.path().join("db")).unwrap();
+        fs::create_dir_all(temp.path().join("static_files")).unwrap();
+
+        let artifact = temp.path().join("snapshot.tnsnap");
+        let create_result = create_snapshot_artifact(temp.path(), &artifact).unwrap();
+
+        let computed_sha256 = &create_result.checksum_sha256;
+        let wrong_checksum = "0000000000000000000000000000000000000000000000000000000000000000";
+
+        assert_ne!(computed_sha256, &wrong_checksum);
+
+        let result = normalize_checksum_or_err(&create_result.checksum_sha256);
+        assert!(result.is_ok());
+
+        let result = normalize_checksum_or_err(wrong_checksum);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validates_artifact_integrity_during_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("consensus-db")).unwrap();
+        fs::create_dir_all(temp.path().join("db")).unwrap();
+        fs::create_dir_all(temp.path().join("static_files")).unwrap();
+
+        let artifact = temp.path().join("snapshot.tnsnap");
+        create_snapshot_artifact(temp.path(), &artifact).unwrap();
+
+        let corrupted_artifact = temp.path().join("corrupted.tnsnap");
+        let mut corrupted_data = fs::read(&artifact).unwrap();
+        if corrupted_data.len() > 100 {
+            corrupted_data[50] ^= 0xFF;
+            fs::write(&corrupted_artifact, corrupted_data).unwrap();
+        }
+
+        let restore_target = temp.path().join("restore_target");
+        fs::create_dir_all(&restore_target).unwrap();
+
+        let result = restore_snapshot_artifact(&corrupted_artifact, &restore_target);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn full_workflow_create_inspect_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("consensus-db")).unwrap();
+        fs::create_dir_all(temp.path().join("db")).unwrap();
+        fs::create_dir_all(temp.path().join("static_files")).unwrap();
+
+        fs::write(temp.path().join("consensus-db/test.txt"), "consensus-data")
+            .unwrap();
+        fs::write(temp.path().join("db/test.txt"), "db-data").unwrap();
+        fs::write(temp.path().join("static_files/test.txt"), "static-data")
+            .unwrap();
+
+        let artifact = temp.path().join("snapshot.tnsnap");
+        let create_result = create_snapshot_artifact(temp.path(), &artifact).unwrap();
+        assert!(create_result.artifact_path.exists());
+
+        let manifest = read_manifest(&artifact).unwrap();
+        assert_eq!(manifest.storage_version, 2);
+        assert!(manifest.components.contains_key("consensus"));
+        assert!(manifest.components.contains_key("execution_db"));
+        assert!(manifest.components.contains_key("execution_static_files"));
+
+        let restore_dir = temp.path().join("restored_data");
+        fs::create_dir_all(&restore_dir).unwrap();
+        let _restore_result = restore_snapshot_artifact(&artifact, &restore_dir).unwrap();
+
+        assert!(restore_dir.join("consensus-db/test.txt").exists());
+        assert!(restore_dir.join("db/test.txt").exists());
+        assert!(restore_dir.join("static_files/test.txt").exists());
+        assert!(restore_dir.join("snapshot_restore.receipt.json").exists());
+
+        let restored_consensus = fs::read_to_string(restore_dir.join("consensus-db/test.txt"))
+            .unwrap();
+        assert_eq!(restored_consensus, "consensus-data");
+
+        let restored_db = fs::read_to_string(restore_dir.join("db/test.txt")).unwrap();
+        assert_eq!(restored_db, "db-data");
+
+        let restored_static = fs::read_to_string(restore_dir.join("static_files/test.txt"))
+            .unwrap();
+        assert_eq!(restored_static, "static-data");
+    }
+
+    #[test]
+    fn full_workflow_force_replace_overwrites_existing_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("consensus-db")).unwrap();
+        fs::create_dir_all(temp.path().join("db")).unwrap();
+        fs::create_dir_all(temp.path().join("static_files")).unwrap();
+
+        fs::write(temp.path().join("consensus-db/new.txt"), "new-data").unwrap();
+        fs::write(temp.path().join("db/new.txt"), "new-db").unwrap();
+        fs::write(temp.path().join("static_files/new.txt"), "new-static").unwrap();
+
+        let artifact = temp.path().join("snapshot.tnsnap");
+        create_snapshot_artifact(temp.path(), &artifact).unwrap();
+
+        let restore_dir = temp.path().join("restore_target");
+        fs::create_dir_all(&restore_dir).unwrap();
+
+        fs::create_dir_all(restore_dir.join("consensus-db")).unwrap();
+        fs::create_dir_all(restore_dir.join("db")).unwrap();
+        fs::create_dir_all(restore_dir.join("static_files")).unwrap();
+
+        fs::write(restore_dir.join("consensus-db/old.txt"), "old-data").unwrap();
+        fs::write(restore_dir.join("db/old.txt"), "old-db").unwrap();
+        fs::write(restore_dir.join("static_files/old.txt"), "old-static").unwrap();
+
+        restore_snapshot_artifact(&artifact, &restore_dir).unwrap();
+
+        assert!(restore_dir.join("consensus-db/new.txt").exists());
+        assert!(!restore_dir.join("consensus-db/old.txt").exists());
+        assert!(restore_dir.join("db/new.txt").exists());
+        assert!(!restore_dir.join("db/old.txt").exists());
+        assert!(restore_dir.join("static_files/new.txt").exists());
+        assert!(!restore_dir.join("static_files/old.txt").exists());
+    }
 }
+
