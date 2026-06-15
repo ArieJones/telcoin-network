@@ -55,6 +55,9 @@ dirs-next = { workspace = true }
 bs58 = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tar = "0.4"
+sha2 = "0.10"
 
 [dev-dependencies]
 tn-types = { workspace = true, features = ["test-utils"] }

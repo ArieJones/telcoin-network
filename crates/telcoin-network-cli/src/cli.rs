@@ -229,6 +229,49 @@ mod tests {
         let _ = Cli::<NoArgs>::try_parse_args_from(["tn", "db", "stats"]).expect("cli parsed");
     }
 
+    #[test]
+    fn parse_db_snapshot_subcommands() {
+        let _ = Cli::<NoArgs>::try_parse_args_from([
+            "tn",
+            "db",
+            "snapshot",
+            "create",
+            "--output",
+            "./snapshot.tnsnap",
+        ])
+        .expect("snapshot create parsed");
+
+        let _ = Cli::<NoArgs>::try_parse_args_from([
+            "tn",
+            "db",
+            "snapshot",
+            "inspect",
+            "--input",
+            "./snapshot.tnsnap",
+        ])
+        .expect("snapshot inspect parsed");
+
+        let _ = Cli::<NoArgs>::try_parse_args_from([
+            "tn",
+            "db",
+            "snapshot",
+            "download",
+            "--url",
+            "https://example.com/snapshot.tnsnap",
+        ])
+        .expect("snapshot download parsed");
+
+        let _ = Cli::<NoArgs>::try_parse_args_from([
+            "tn",
+            "db",
+            "snapshot",
+            "restore",
+            "--input",
+            "./snapshot.tnsnap",
+        ])
+        .expect("snapshot restore parsed");
+    }
+
     /// Tests that the help message is parsed correctly. This ensures that clap args are configured
     /// correctly and no conflicts are introduced via attributes that would result in a panic at
     /// runtime

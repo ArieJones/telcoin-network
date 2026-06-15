@@ -1,17 +1,19 @@
 //! DB diagnostics command.
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use comfy_table::{Cell, Row, Table as ComfyTable};
 use human_bytes::human_bytes;
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 use tn_config::TelcoinDirs as _;
 use tn_reth::{
     iter_static_files, open_db_read_only, traits::TNPrimitives, DatabaseArguments, DatabaseEnv,
     RethDatabaseT as _, RethMdbxError, StaticFileProvider, Tables,
 };
+use crate::snapshot::{create_snapshot_artifact, read_manifest};
 
 /// Inspect the execution database and print read-only statistics.
 #[derive(Debug, Parser)]
@@ -26,6 +28,65 @@ pub struct DbCommand {
 enum DbSubcommand {
     /// Print execution database statistics.
     Stats,
+
+    /// Manage snapshot workflows for create, inspect, download, and restore.
+    Snapshot(SnapshotCommand),
+}
+
+/// Snapshot command group.
+#[derive(Debug, Args)]
+struct SnapshotCommand {
+    /// Snapshot operation to execute.
+    #[command(subcommand)]
+    command: SnapshotSubcommand,
+}
+
+/// Supported snapshot operations.
+#[derive(Debug, Subcommand)]
+enum SnapshotSubcommand {
+    /// Create a snapshot artifact from local node data.
+    Create(SnapshotCreateArgs),
+
+    /// Inspect metadata for a snapshot artifact.
+    Inspect(SnapshotInspectArgs),
+
+    /// Download a snapshot artifact from a direct URL.
+    Download(SnapshotDownloadArgs),
+
+    /// Restore node data from a snapshot artifact.
+    Restore(SnapshotRestoreArgs),
+}
+
+#[derive(Debug, Args)]
+struct SnapshotCreateArgs {
+    /// Destination path for snapshot artifact.
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct SnapshotInspectArgs {
+    /// Path to the snapshot artifact or extracted snapshot directory.
+    #[arg(long, value_name = "PATH")]
+    input: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct SnapshotDownloadArgs {
+    /// HTTP/HTTPS URL for the snapshot artifact.
+    #[arg(long, value_name = "URL")]
+    url: String,
+
+    /// Destination path for the downloaded artifact.
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct SnapshotRestoreArgs {
+    /// Path to the snapshot artifact to restore.
+    #[arg(long, value_name = "PATH")]
+    input: PathBuf,
 }
 
 impl DbCommand {
@@ -53,9 +114,89 @@ impl DbCommand {
                 }
                 println!("{}", db_stats_table(&db)?);
             }
+            DbSubcommand::Snapshot(snapshot) => {
+                ensure_snapshot_commands_offline()?;
+                match &snapshot.command {
+                    SnapshotSubcommand::Create(args) => {
+                        let output = args
+                            .output
+                            .clone()
+                            .unwrap_or_else(|| datadir.join("snapshot.tnsnap"));
+                        let created = create_snapshot_artifact(&datadir, &output)?;
+                        println!(
+                            "snapshot artifact created: {}",
+                            created.artifact_path.display()
+                        );
+                        println!(
+                            "snapshot checksum sidecar: {}",
+                            created.checksum_path.display()
+                        );
+                        println!(
+                            "snapshot sha256: {}",
+                            created.checksum_sha256
+                        );
+                    }
+                    SnapshotSubcommand::Inspect(args) => {
+                        let input = args
+                            .input
+                            .clone()
+                            .unwrap_or_else(|| datadir.join("snapshot.tnsnap"));
+                        let manifest = read_manifest(&input)?;
+                        println!(
+                            "snapshot manifest version={} created_at={} datadir={} consensus_head={} execution_head={} checksum={}",
+                            manifest.version,
+                            manifest.created_at_unix_secs,
+                            manifest.datadir,
+                            manifest.consensus_head.number,
+                            manifest.execution_head.number,
+                            manifest.checksum_sha256,
+                        );
+                    }
+                    SnapshotSubcommand::Download(args) => {
+                        let output = args
+                            .output
+                            .clone()
+                            .unwrap_or_else(|| datadir.join("snapshot.tnsnap"));
+                        println!(
+                            "snapshot download foundation complete: url={} output={} (download pipeline to follow)",
+                            args.url,
+                            output.display()
+                        );
+                    }
+                    SnapshotSubcommand::Restore(args) => {
+                        println!(
+                            "snapshot restore foundation complete: input={} (restore pipeline to follow)",
+                            args.input.display()
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
+}
+
+fn ensure_snapshot_commands_offline() -> eyre::Result<()> {
+    let output = Command::new("ps").args(["-axo", "command"]).output()?;
+    if !output.status.success() {
+        return Err(eyre::eyre!(
+            "failed to verify offline precondition: unable to inspect running processes"
+        ));
+    }
+
+    let proc_table = String::from_utf8_lossy(&output.stdout);
+    if let Some(active_node_cmd) = proc_table.lines().find(|line| is_telcoin_node_process(line)) {
+        return Err(eyre::eyre!(
+            "snapshot commands require offline mode; stop active telcoin node process first: {active_node_cmd}"
+        ));
+    }
+
+    Ok(())
+}
+
+fn is_telcoin_node_process(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.contains("telcoin-network") && trimmed.contains(" node")
 }
 
 #[derive(Debug, Clone)]
@@ -269,7 +410,9 @@ fn db_stats_table(db: &DatabaseEnv) -> eyre::Result<ComfyTable> {
 
 #[cfg(test)]
 mod tests {
-    use super::{file_len_if_exists, static_files_summary_table};
+    use super::{
+        file_len_if_exists, is_telcoin_node_process, static_files_summary_table,
+    };
     use crate::{
         cli::{Cli, Commands},
         NoArgs,
@@ -313,5 +456,16 @@ mod tests {
 
         assert_eq!(file_len_if_exists(&existing_path).unwrap(), 4);
         assert_eq!(file_len_if_exists(&temp_dir.path().join("missing.bin")).unwrap(), 0);
+    }
+
+    #[test]
+    fn detects_telcoin_node_process_lines() {
+        assert!(is_telcoin_node_process(
+            "/usr/local/bin/telcoin-network node --chain testnet"
+        ));
+        assert!(!is_telcoin_node_process(
+            "/usr/local/bin/telcoin-network db snapshot inspect"
+        ));
+        assert!(!is_telcoin_node_process("/usr/bin/other-process --flag"));
     }
 }
