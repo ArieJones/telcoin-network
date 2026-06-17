@@ -272,6 +272,30 @@ mod tests {
             "./snapshot.tnsnap",
         ])
         .expect("snapshot restore parsed");
+
+        let _ = Cli::<NoArgs>::try_parse_args_from([
+            "tn",
+            "db",
+            "snapshot",
+            "deploy",
+            "--url",
+            "https://example.com/snapshot.tnsnap",
+        ])
+        .expect("snapshot deploy (url only) parsed");
+
+        let _ = Cli::<NoArgs>::try_parse_args_from([
+            "tn",
+            "db",
+            "snapshot",
+            "deploy",
+            "--url",
+            "https://example.com/snapshot.tnsnap",
+            "--sha256",
+            "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+            "--staging",
+            "/tmp/snap.tnsnap",
+        ])
+        .expect("snapshot deploy (all args) parsed");
     }
 
     /// Tests that the help message is parsed correctly. This ensures that clap args are configured

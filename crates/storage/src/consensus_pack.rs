@@ -463,6 +463,207 @@ impl ConsensusPack {
 
 pub const DATA_NAME: &str = Inner::DATA_NAME;
 
+/// Per-epoch validation result returned by [`validate_consensus_db`].
+#[derive(Debug, Clone)]
+pub struct EpochValidationResult {
+    /// The epoch that was validated.
+    pub epoch: Epoch,
+    /// Number of consensus headers verified.
+    pub consensus_count: u64,
+    /// Validated successfully.
+    pub ok: bool,
+    /// Error description if validation failed.
+    pub error: Option<String>,
+}
+
+/// Reindex and validate an on-disk epoch pack directory.
+///
+/// Reads the data file sequentially using the raw [`PackIter`], validating the
+/// consensus chain (parent hashes) and rebuilding all three index files
+/// (`idx/`, `hash/`, `bhash/`) from scratch.
+///
+/// The `epoch_record` and `previous_epoch` arguments are used to:
+/// 1. Validate the epoch metadata embedded in the first pack record.
+/// 2. Confirm the final consensus header in the data file matches
+///    `epoch_record.final_consensus`.
+///
+/// On success, returns the number of consensus headers indexed.
+pub fn reindex_epoch_pack<P: AsRef<Path>>(
+    base_path: P,
+    epoch_record: &EpochRecord,
+    previous_epoch: &EpochRecord,
+) -> Result<u64, PackError> {
+    let epoch = epoch_record.epoch;
+    let epoch_dir = base_path.as_ref().join(format!("epoch-{epoch}"));
+    let data_file_path = epoch_dir.join(Inner::DATA_NAME);
+
+    if !data_file_path.exists() {
+        return Err(PackError::ReadError(format!(
+            "pack data file missing for epoch {epoch}: {}",
+            data_file_path.display()
+        )));
+    }
+
+    // Remove existing index directories so we get a clean slate.
+    for subdir in [Inner::CONSENSUS_POS_NAME, Inner::CONSENSUS_HASH_NAME, Inner::BATCH_HASH_NAME] {
+        let dir = epoch_dir.join(subdir);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)
+                .map_err(|e| PackError::IO(Arc::new(e)))?;
+        }
+    }
+
+    // Open the data file via Pack (read-only) and create fresh, empty index structures.
+    let data = Pack::<PackRecord>::open(&data_file_path, epoch as u64, true, PackCompression::ZStd)?;
+    let data_header = data.header().clone();
+    let data_len = data.file_len();
+
+    // Create fresh writable index files.
+    let mut consensus_pos_idx: PositionIndex<IndexPositions> =
+        Inner::open_pdx_file(&epoch_dir, &data_header, false)?;
+    let builder = BuildHasherDefault::<FxHasher>::default();
+    let mut consensus_digests: HdxIndex<32, BuildHasherDefault<FxHasher>> =
+        HdxIndex::open_hdx_file(
+            epoch_dir.join(Inner::CONSENSUS_HASH_NAME),
+            &data_header,
+            builder,
+            false,
+        )
+        .map_err(OpenError::IndexFileOpen)?;
+    let builder = BuildHasherDefault::<FxHasher>::default();
+    let mut batch_digests: HdxIndex<32, BuildHasherDefault<FxHasher>> = HdxIndex::open_hdx_file(
+        epoch_dir.join(Inner::BATCH_HASH_NAME),
+        &data_header,
+        builder,
+        false,
+    )
+    .map_err(OpenError::IndexFileOpen)?;
+
+    // Initialise index file-length bookmarks to match the (empty) data boundary.
+    let initial_data_len = DATA_HEADER_BYTES as u64;
+    consensus_digests.set_data_file_length(initial_data_len);
+    batch_digests.set_data_file_length(initial_data_len);
+
+    // Walk the data file using the synchronous PackIter.
+    let raw_file = std::fs::File::open(&data_file_path)
+        .map_err(|e| PackError::IO(Arc::new(e)))?;
+    let mut iter =
+        crate::archive::pack_iter::PackIter::<PackRecord, _>::open(raw_file, epoch as u64)
+            .map_err(|e| PackError::ReadError(format!("failed to open pack iterator: {e}")))?;
+
+    // First record must be EpochMeta.
+    let epoch_meta = match iter.next() {
+        Some(Ok(rec)) => rec.into_epoch()?,
+        Some(Err(e)) => return Err(PackError::ReadError(e.to_string())),
+        None => return Err(PackError::NotEpoch),
+    };
+    Inner::verify_epoch_meta(epoch, previous_epoch, &epoch_meta)?;
+
+    let mut parent_digest = if epoch == 0 {
+        ConsensusHeader::default().digest()
+    } else {
+        previous_epoch.final_consensus.hash
+    };
+
+    // Walk records: Batch records come before their ConsensusHeader record.
+    let mut first_batch_pos: Option<u64> = None;
+    let mut consensus_idx: u64 = 0;
+    let mut last_consensus_header: Option<ConsensusHeader> = None;
+
+    // We need byte positions. PackIter exposes `position()` which uses BufReader::stream_position.
+    // We need to drop the `data` Pack above to avoid two file handles on a read-only pack.
+    // Instead use a fresh raw PackIter opened independently.
+    drop(data);
+    let raw_file2 = std::fs::File::open(&data_file_path)
+        .map_err(|e| PackError::IO(Arc::new(e)))?;
+    drop(iter); // drop first iter, use raw_iter below via Pack::raw_iter
+    let data2 = Pack::<PackRecord>::open(&data_file_path, epoch as u64, true, PackCompression::ZStd)?;
+    let mut raw_iter = data2.raw_iter()
+        .map_err(|e| PackError::ReadError(e.to_string()))?;
+    drop(raw_file2);
+
+    // Consume EpochMeta.
+    match raw_iter.next() {
+        Some(Ok(PackRecord::EpochMeta(_))) => {}
+        Some(Ok(_)) => return Err(PackError::NotEpoch),
+        Some(Err(e)) => return Err(PackError::ReadError(e.to_string())),
+        None => return Err(PackError::NotEpoch),
+    };
+
+    loop {
+        let pos = raw_iter.position()
+            .map_err(|e| PackError::IO(Arc::new(e)))?;
+        match raw_iter.next() {
+            None => break,
+            Some(Err(e)) => return Err(PackError::ReadError(e.to_string())),
+            Some(Ok(PackRecord::EpochMeta(_))) => {
+                return Err(PackError::ReadError("unexpected EpochMeta mid-pack".to_string()));
+            }
+            Some(Ok(PackRecord::Batch(batch))) => {
+                let digest = batch.digest();
+                if first_batch_pos.is_none() {
+                    first_batch_pos = Some(pos);
+                }
+
+                batch_digests
+                    .save(digest, pos)
+                    .map_err(|e| PackError::IndexAppend(format!("batch {e}")))?;
+                let len = raw_iter.position()
+                    .map_err(|e| PackError::IO(Arc::new(e)))?;
+                batch_digests.set_data_file_length(len);
+                consensus_digests.set_data_file_length(len);
+            }
+            Some(Ok(PackRecord::Consensus(header))) => {
+                let h: ConsensusHeader = *header;
+                if h.parent_hash != parent_digest {
+                    return Err(PackError::InvalidConsensusChain);
+                }
+                let consensus_digest: ConsensusHeaderDigest = h.digest();
+                let end_pos = raw_iter.position()
+                    .map_err(|e| PackError::IO(Arc::new(e)))?;
+                let batch_start = first_batch_pos.unwrap_or(pos);
+
+                consensus_digests
+                    .save(consensus_digest.into(), pos)
+                    .map_err(|e| PackError::IndexAppend(format!("consensus {e}")))?;
+                consensus_pos_idx
+                    .save(consensus_idx, IndexPositions::new(pos, batch_start, end_pos))
+                    .map_err(|e| PackError::IndexAppend(format!("consensus pos {e}")))?;
+
+                consensus_digests.set_data_file_length(end_pos);
+                batch_digests.set_data_file_length(end_pos);
+
+                parent_digest = consensus_digest;
+                last_consensus_header = Some(h);
+                consensus_idx += 1;
+                first_batch_pos = None;
+            }
+        }
+    }
+
+    // Verify the chain ends at the expected final consensus header.
+    let last_header = last_consensus_header
+        .ok_or_else(|| PackError::ReadError("pack has no consensus records".to_string()))?;
+    let expected_final = epoch_record.final_consensus.number;
+    if last_header.number != expected_final {
+        return Err(PackError::InvalidConsensusNumber(last_header.number, expected_final));
+    }
+    if last_header.digest() != epoch_record.final_consensus.hash {
+        return Err(PackError::InvalidConsensusChain);
+    }
+
+    // Bring index file lengths up to the real data file length.
+    consensus_digests.set_data_file_length(data_len);
+    batch_digests.set_data_file_length(data_len);
+
+    // Sync all indexes to disk.
+    consensus_pos_idx.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
+    consensus_digests.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
+    batch_digests.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
+
+    Ok(consensus_idx)
+}
+
 #[derive(Debug)]
 struct Inner {
     data: Pack<PackRecord>,

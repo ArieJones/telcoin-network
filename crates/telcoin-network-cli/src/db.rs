@@ -13,6 +13,7 @@ use tn_reth::{
     iter_static_files, open_db_read_only, traits::TNPrimitives, DatabaseArguments, DatabaseEnv,
     RethDatabaseT as _, RethMdbxError, StaticFileProvider, Tables,
 };
+use tn_storage::consensus::ConsensusChain;
 use crate::snapshot::{
     create_snapshot_artifact, download_snapshot_artifact, read_manifest, restore_snapshot_artifact,
     ComponentManifest,
@@ -58,6 +59,12 @@ enum SnapshotSubcommand {
 
     /// Restore node data from a snapshot artifact.
     Restore(SnapshotRestoreArgs),
+
+    /// Download a snapshot, deploy it to the datadir, and validate/reindex consensus-db.
+    ///
+    /// This is the recommended single-step command for operators bootstrapping
+    /// from a snapshot archive. On success the node is ready to start.
+    Deploy(SnapshotDeployArgs),
 }
 
 #[derive(Debug, Args)]
@@ -96,6 +103,25 @@ struct SnapshotRestoreArgs {
     /// Path to the snapshot artifact to restore.
     #[arg(long, value_name = "PATH")]
     input: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct SnapshotDeployArgs {
+    /// HTTP/HTTPS URL for the snapshot artifact.
+    #[arg(long, value_name = "URL")]
+    url: String,
+
+    /// Expected SHA256 digest for the artifact.
+    ///
+    /// If omitted, the downloader fetches `<url>.sha256` and parses its first token.
+    #[arg(long, value_name = "SHA256")]
+    sha256: Option<String>,
+
+    /// Staging path for the downloaded artifact file before extraction.
+    ///
+    /// Defaults to `<datadir>/snapshot_deploy.tnsnap`.
+    #[arg(long, value_name = "PATH")]
+    staging: Option<PathBuf>,
 }
 
 impl DbCommand {
@@ -221,6 +247,75 @@ impl DbCommand {
                             "snapshot block restored: {}",
                             restored.manifest.block
                         );
+                    }
+                    SnapshotSubcommand::Deploy(args) => {
+                        let staging = args
+                            .staging
+                            .clone()
+                            .unwrap_or_else(|| datadir.join("snapshot_deploy.tnsnap"));
+
+                        // Step 1: download and verify.
+                        println!("[1/3] Downloading snapshot from {}", args.url);
+                        let downloaded = download_snapshot_artifact(
+                            &args.url,
+                            &staging,
+                            args.sha256.as_deref(),
+                        )?;
+                        println!(
+                            "      artifact: {}",
+                            downloaded.artifact_path.display()
+                        );
+                        println!("      sha256:   {}", downloaded.checksum_sha256);
+
+                        // Step 2: extract and force-replace datadir.
+                        println!("[2/3] Deploying snapshot to {}", datadir.display());
+                        let restored =
+                            restore_snapshot_artifact(&downloaded.artifact_path, &datadir)?;
+                        println!(
+                            "      restored block: {}",
+                            restored.manifest.block
+                        );
+
+                        // Step 3: validate and reindex consensus-db.
+                        let consensus_db = datadir.join("consensus-db");
+                        println!("[3/3] Validating and reindexing consensus-db at {}", consensus_db.display());
+                        let results = ConsensusChain::validate_and_reindex(&consensus_db)?;
+                        let total_epochs = results.len();
+                        let failed: Vec<_> = results
+                            .iter()
+                            .filter(|r| !r.ok)
+                            .collect();
+
+                        for r in &results {
+                            if r.ok {
+                                println!(
+                                    "      epoch {:>4}: ok  ({} consensus headers)",
+                                    r.epoch, r.consensus_count
+                                );
+                            } else {
+                                println!(
+                                    "      epoch {:>4}: FAILED  {}",
+                                    r.epoch,
+                                    r.error.as_deref().unwrap_or("unknown error")
+                                );
+                            }
+                        }
+
+                        if !failed.is_empty() {
+                            return Err(eyre::eyre!(
+                                "consensus-db validation failed for {} of {} epochs",
+                                failed.len(),
+                                total_epochs
+                            ));
+                        }
+
+                        // Remove staged artifact after successful deploy.
+                        let _ = fs::remove_file(&downloaded.artifact_path);
+                        let _ = fs::remove_file(&downloaded.checksum_path);
+
+                        println!("\nSnapshot deployed successfully.");
+                        println!("Restore receipt: {}", restored.receipt_path.display());
+                        println!("Node is ready to start.");
                     }
                 }
             }

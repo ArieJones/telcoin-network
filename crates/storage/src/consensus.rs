@@ -720,7 +720,71 @@ impl ConsensusChain {
         self.current_pack.lock().clone()
     }
 
-    /// Get a static pack file from the cache if available or create and cache if not.
+    /// Validate and reindex the consensus-db at `consensus_db_path`.
+    ///
+    /// Iterates every epoch present in the `EpochRecordDb`, deletes the
+    /// existing index files for each epoch, and rebuilds them by scanning the
+    /// data pack sequentially.  The consensus chain (parent hashes) is
+    /// verified against the signed `EpochRecord.final_consensus` at each epoch
+    /// boundary, giving the same trust guarantee as the peer `stream_import`
+    /// path without requiring a network connection.
+    ///
+    /// Returns a list of per-epoch results so the caller can report progress.
+    pub fn validate_and_reindex<P: AsRef<Path>>(
+        consensus_db_path: P,
+    ) -> eyre::Result<Vec<crate::consensus_pack::EpochValidationResult>> {
+        use crate::consensus_pack::{reindex_epoch_pack, EpochValidationResult};
+
+        let path = consensus_db_path.as_ref();
+        let epoch_db = EpochRecordDb::open(path)?;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        // Collect all epoch records in order.
+        let mut records: Vec<EpochRecord> = Vec::new();
+        let mut epoch: u32 = 0;
+        loop {
+            match rt.block_on(epoch_db.record_by_epoch(epoch)) {
+                Some(rec) => {
+                    records.push(rec);
+                    epoch += 1;
+                }
+                None => break,
+            }
+        }
+
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::with_capacity(records.len());
+
+        // Synthetic epoch 0 "previous" with all-zero defaults.
+        let genesis_previous = EpochRecord::default();
+
+        for (i, record) in records.iter().enumerate() {
+            let previous = if i == 0 { &genesis_previous } else { &records[i - 1] };
+            match reindex_epoch_pack(path, record, previous) {
+                Ok(count) => results.push(EpochValidationResult {
+                    epoch: record.epoch,
+                    consensus_count: count,
+                    ok: true,
+                    error: None,
+                }),
+                Err(e) => results.push(EpochValidationResult {
+                    epoch: record.epoch,
+                    consensus_count: 0,
+                    ok: false,
+                    error: Some(e.to_string()),
+                }),
+            }
+        }
+
+        Ok(results)
+    }
+
     async fn get_static(&self, epoch: Epoch) -> Result<ConsensusPack, PackError> {
         if let Some(pack) = self.current_pack() {
             if pack.epoch() == epoch {
