@@ -132,7 +132,7 @@ impl DbCommand {
     /// subcommand (reth-style, `telcoin-network db --datadir PATH stats`), or after the
     /// subcommand.
     pub fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
-        match self.command {
+        match &self.command {
             DbSubcommand::Stats => {
                 let db_path = datadir.reth_db_path();
                 let db = open_db_read_only(&db_path, DatabaseArguments::default())?;
