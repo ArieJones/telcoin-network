@@ -296,6 +296,13 @@ async fn get_consensus_header_range<DB: TNDatabase>(
                 if retries < 5 {
                     retries += 1;
                 }
+                warn!(
+                    target: "tn::observer",
+                    ?number,
+                    ?hash,
+                    retries,
+                    "retrying consensus header fetch"
+                );
                 tokio::time::sleep(Duration::from_secs(retries)).await;
             }
         }

@@ -742,6 +742,13 @@ where
                     self.connected_peers.rotate_left(1);
                 }
                 if let Some(peer) = self.connected_peers.front() {
+                    debug!(
+                        target: "network",
+                        selected_peer = ?peer,
+                        connected_peers = self.connected_peers.len(),
+                        ?request,
+                        "SendRequestAny selected peer"
+                    );
                     let request_id = self.swarm.behaviour_mut().req_res.send_request(peer, request);
                     self.outbound_requests.insert((*peer, request_id), reply);
                 } else {

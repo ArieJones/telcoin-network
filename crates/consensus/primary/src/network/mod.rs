@@ -341,36 +341,76 @@ impl PrimaryNetworkHandle {
     ) -> NetworkResult<ConsensusHeader> {
         const TIMEOUT: Duration = Duration::from_secs(10);
         let request = PrimaryRequest::ConsensusHeader { number, hash };
+        let mut peers_tried = Vec::with_capacity(3);
         // Try up to three times (from three peers) to get consensus.
         // This could be a lot more complicated but this KISS method should work fine.
-        for _ in 0..3 {
+        for attempt in 1..=3 {
             let res = self.handle.send_request_any(request.clone()).await?;
             let res = match tokio::time::timeout(TIMEOUT, res).await {
                 Ok(r) => r,
                 Err(_) => {
-                    tracing::warn!(target: "primary::network", ?number, "request_consensus timed out waiting for peer response");
+                    tracing::warn!(
+                        target: "primary::network",
+                        ?number,
+                        ?hash,
+                        attempt,
+                        "request_consensus timed out waiting for peer response"
+                    );
                     continue;
                 }
             };
             let res = res?;
-            if let Ok(NetworkResponseMessage {
-                peer,
-                result: PrimaryResponse::ConsensusHeader(header),
-            }) = res
-            {
-                if header.digest() == hash && header.number == number {
-                    return Ok(Arc::unwrap_or_clone(header));
-                } else {
-                    tracing::warn!(target: "primary::network", "Returned header does not match number {number}/{} or hash {hash}/{}, try again!",
+            match res {
+                Ok(NetworkResponseMessage {
+                    peer,
+                    result: PrimaryResponse::ConsensusHeader(header),
+                }) => {
+                    peers_tried.push(peer.to_string());
+                    if header.digest() == hash && header.number == number {
+                        return Ok(Arc::unwrap_or_clone(header));
+                    }
+                    tracing::warn!(target: "primary::network", %peer, ?number, ?hash, attempt,
+                        "Returned header does not match requested number/hash: got {}/{}",
                         header.number,
                         header.digest()
                     );
                     // Give the naughty peer a penalty.
                     self.report_penalty(peer, Penalty::Medium).await;
                 }
+                Ok(NetworkResponseMessage { peer, result }) => {
+                    peers_tried.push(peer.to_string());
+                    tracing::warn!(
+                        target: "primary::network",
+                        %peer,
+                        ?number,
+                        ?hash,
+                        attempt,
+                        ?result,
+                        "request_consensus got unexpected response type"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "primary::network",
+                        ?e,
+                        ?number,
+                        ?hash,
+                        attempt,
+                        "request_consensus received transport or protocol error"
+                    );
+                }
             }
         }
-        Err(NetworkError::RPCError("Could not get the consensus header!".to_string()))
+        tracing::warn!(
+            target: "primary::network",
+            ?number,
+            ?hash,
+            ?peers_tried,
+            "Could not get consensus header after retries"
+        );
+        Err(NetworkError::RPCError(format!(
+            "Could not get the consensus header after retries. peers_tried={peers_tried:?}"
+        )))
     }
 
     /// Request the raw (serialized) consensus output bytes for `number` from a specific peer.
