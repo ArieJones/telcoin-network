@@ -555,19 +555,63 @@ impl PrimaryNetworkHandle {
         hash: Option<EpochDigest>,
     ) -> NetworkResult<(EpochRecord, EpochCertificate)> {
         let request = PrimaryRequest::EpochRecord { epoch, hash };
+        let mut peers_tried = Vec::with_capacity(3);
         // Try up to three times (from three peers) to get consensus.
         // This could be a lot more complicated but this KISS method should work fine.
-        for _ in 0..3 {
+        for attempt in 1..=3 {
             let res = self.handle.send_request_any(request.clone()).await?;
-            if let Ok(Ok(NetworkResponseMessage {
-                peer: _,
-                result: PrimaryResponse::EpochRecord { record, certificate },
-            })) = res.await
-            {
-                return Ok((record, certificate));
+            match res.await {
+                Ok(Ok(NetworkResponseMessage {
+                    peer,
+                    result: PrimaryResponse::EpochRecord { record, certificate },
+                })) => {
+                    peers_tried.push(peer.to_string());
+                    return Ok((record, certificate));
+                }
+                Ok(Ok(NetworkResponseMessage { peer, result })) => {
+                    peers_tried.push(peer.to_string());
+                    warn!(
+                        target: "primary::network",
+                        %peer,
+                        ?epoch,
+                        ?hash,
+                        attempt,
+                        ?result,
+                        "request_epoch_cert got unexpected response type"
+                    );
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        target: "primary::network",
+                        ?e,
+                        ?epoch,
+                        ?hash,
+                        attempt,
+                        "request_epoch_cert received transport or protocol error"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        target: "primary::network",
+                        ?e,
+                        ?epoch,
+                        ?hash,
+                        attempt,
+                        "request_epoch_cert response channel dropped"
+                    );
+                }
             }
         }
-        Err(NetworkError::RPCError("Could not get the epoch record!".to_string()))
+        warn!(
+            target: "primary::network",
+            ?epoch,
+            ?hash,
+            ?peers_tried,
+            "Could not get epoch record after retries"
+        );
+        Err(NetworkError::RPCError(format!(
+            "Could not get the epoch record after retries. peers_tried={peers_tried:?}"
+        )))
     }
 
     /// Report a penalty to the network's peer manager.

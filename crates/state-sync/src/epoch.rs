@@ -140,7 +140,7 @@ async fn collect_epoch_records(
                 // We delibrately go past the latest epoch so this is expected to happen.
                 info!(
                     target: "epoch-manager",
-                    "failed to retrieve epoch from a peer {epoch}: {err}",
+                    "failed to retrieve epoch record from peers for epoch {epoch}: {err}",
                 );
             }
         }
